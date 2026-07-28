@@ -1,0 +1,18 @@
+# Despliegue del motor de optimización en Render.
+# Se puede crear el servicio a mano en el panel con estos mismos valores.
+services:
+  - type: web
+    name: ruteo-motor
+    runtime: python
+    plan: free            # el plan gratuito se duerme a los 15 min de inactividad
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /salud
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # El frontend llama al motor a través de su propio proxy, así que no hace
+      # falta abrir CORS a ningún dominio. Se deja restringido a localhost.
+      - key: ORIGENES_PERMITIDOS
+        value: http://localhost:3005

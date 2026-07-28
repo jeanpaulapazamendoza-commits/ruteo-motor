@@ -1,0 +1,76 @@
+# Motor de ruteo — API
+
+Expone como servicio HTTP el mismo motor de optimización que usa la app de
+Streamlit. **No reimplementa nada**: las funciones se extraen de
+`ruteo-tiendas-v2/app.py` con `extraer_motor.py`, así que ambas aplicaciones
+comparten exactamente el mismo algoritmo.
+
+## Arrancar
+
+```bash
+pip install -r requirements.txt
+python -m uvicorn api:app --port 8010 --reload
+```
+
+Documentación interactiva en <http://localhost:8010/docs>.
+
+## Endpoints
+
+| Método | Ruta | Qué hace |
+|---|---|---|
+| GET | `/salud` | Comprobación de vida |
+| POST | `/agrupar` | Agrupa tiendas por capacidad, bultos, flota o K-Means |
+| POST | `/rutear` | Calcula la ruta óptima de cada grupo (OR-Tools) |
+| POST | `/tiendas-en-sector` | Qué tiendas caen dentro de un polígono del mapa |
+
+### `/agrupar`
+
+Admite los mismos modos que Streamlit:
+
+- `criterio: "tiendas"` — máximo de paradas por ruta.
+- `criterio: "bultos"` — máximo de carga por ruta.
+- `criterio: "flota"` — flota heterogénea (`[{cantidad, capacidad, max_tiendas}]`),
+  con `vueltas` (1-3) y `uso_flota` (`compacto` = ~30 % más vehículos y zonas
+  más limpias, o `minimo` = rutas más llenas).
+- `modo: "clasico"` — K-Means con K fijo.
+- `grupos_manuales` — respeta una selección hecha a mano en el mapa.
+
+Devuelve grupos con nº de tiendas, bultos, prioritarias, vehículo asignado,
+vuelta y centro; más la lista de tiendas `sin_asignar`.
+
+### `/rutear`
+
+Parámetros: `motor` (`osrm` calles reales / `haversine` línea recta / `ors`),
+`cerrado`, `hora_salida`, `servicio_min`, `servicio_min_bulto`, `jornada_h`,
+`costo_fijo`, `costo_km`, `tiempo_tsp`.
+
+Respeta **ventanas horarias** y **prioridades** de cada tienda, y devuelve por
+ruta: paradas en orden con su ETA, km, duración, costo, geometría para el mapa
+y links de Google Maps por tramos.
+
+## Re-extraer el motor
+
+Si cambias el algoritmo en la app de Streamlit:
+
+```bash
+cd ..
+python extraer_motor.py
+```
+
+Reescribe `motor_ruteo/*.py` quitando los decoradores de Streamlit
+(`@st.cache_data` → `@lru_cache`). No edites esos archivos a mano.
+
+## Despliegue
+
+Pensado para Render o Railway (Vercel no ejecuta procesos Python persistentes).
+Define `ORIGENES_PERMITIDOS` con la URL del frontend, separadas por comas:
+
+```
+ORIGENES_PERMITIDOS=https://tu-app.vercel.app
+```
+
+Comando de arranque:
+
+```bash
+uvicorn api:app --host 0.0.0.0 --port $PORT
+```
