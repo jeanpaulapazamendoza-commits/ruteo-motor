@@ -108,6 +108,42 @@ class PeticionSector(BaseModel):
 # ===========================================================
 # Utilidades
 # ===========================================================
+def _texto(v) -> str | None:
+    """
+    Devuelve texto, o None si no hay valor.
+
+    Los campos opcionales vacíos entran como None y pandas los puede volver
+    NaN. Un NaN suelto en la respuesta rompe la serialización JSON (no es
+    JSON válido) y el despacho entero se cae con un 500, así que ningún
+    valor de texto sale de aquí sin pasar por esta función.
+    """
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return None
+    return str(v)
+
+
+def _sin_nan(obj):
+    """
+    Cambia por None cualquier NaN o infinito que quede en la respuesta.
+
+    Es la última red: un solo NaN perdido en un campo hace que FastAPI no
+    pueda serializar y devuelva 500 sin decir por qué, tirando abajo el
+    despacho completo por un dato opcional que venía vacío.
+    """
+    if isinstance(obj, dict):
+        return {k: _sin_nan(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sin_nan(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    if isinstance(obj, np.floating):
+        v = float(obj)
+        return v if math.isfinite(v) else None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    return obj
+
+
 def _a_dataframe(tiendas: list[Tienda]) -> pd.DataFrame:
     if not tiendas:
         raise HTTPException(400, "No se recibió ninguna tienda.")
@@ -219,7 +255,7 @@ def agrupar(p: PeticionAgrupar):
         })
 
     sin_asignar = df.loc[df["grupo"] < 0, "id"].tolist()
-    return {
+    return _sin_nan({
         "grupos": grupos,
         "sin_asignar": sin_asignar,
         "sobrecupo": bool(sobrecupo),
@@ -229,7 +265,7 @@ def agrupar(p: PeticionAgrupar):
             "bultos": int(df["cantidad_bultos"].sum()),
             "sin_asignar": len(sin_asignar),
         },
-    }
+    })
 
 
 @app.post("/rutear")
@@ -290,9 +326,9 @@ def rutear(p: PeticionRutear):
         paradas = [{
             "id": tid,
             "orden": n + 1,
-            "codigo": str(sub.loc[tid, "codigo_sucursal"]),
-            "nombre": str(sub.loc[tid, "name_sucursal"]),
-            "distrito": sub.loc[tid, "distrito"],
+            "codigo": _texto(sub.loc[tid, "codigo_sucursal"]) or "",
+            "nombre": _texto(sub.loc[tid, "name_sucursal"]) or "",
+            "distrito": _texto(sub.loc[tid, "distrito"]),
             "bultos": int(sub.loc[tid, "cantidad_bultos"]),
             "prioridad": int(sub.loc[tid, "prioridad"]),
             "lat": float(sub.loc[tid, "latitud"]),
@@ -321,7 +357,7 @@ def rutear(p: PeticionRutear):
         })
 
     validas = [r for r in rutas if not r.get("error")]
-    return {
+    return _sin_nan({
         "rutas": rutas,
         "totales": {
             "rutas": len(validas),
@@ -330,7 +366,7 @@ def rutear(p: PeticionRutear):
             "costo": round(sum(r.get("costo", 0) for r in validas), 2),
             "paradas": sum(len(r.get("paradas", [])) for r in validas),
         },
-    }
+    })
 
 
 @app.post("/tiendas-en-sector")
