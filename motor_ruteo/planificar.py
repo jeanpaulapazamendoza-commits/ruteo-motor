@@ -256,7 +256,11 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
         routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION)
     params.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
-    params.time_limit.FromSeconds(int(max(1, tiempo_seg)))
+    # La búsqueda guiada no se detiene sola: gasta todo el tiempo que se le dé
+    # aunque haya dos tiendas. Lo pedido es un tope; el tiempo real crece con
+    # el tamaño —un segundo por cada ocho tiendas— y nunca baja de dos.
+    limite = max(2, min(int(tiempo_seg), -(-m // 8)))
+    params.time_limit.FromSeconds(limite)
 
     # ── Punto de partida: la agrupación de siempre ─────────────────────────
     solucion = None
