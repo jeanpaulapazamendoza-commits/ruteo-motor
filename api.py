@@ -23,6 +23,8 @@ from motor_ruteo import (
     hora_a_segundos,
     kmeans_balanceado,
     links_google_maps,
+    osrm_ruta_orden,
+    planificar_flota,
     proyectar_metros,
     puntos_en_poligono,
     rutear_cluster_ortools,
@@ -98,6 +100,25 @@ class PeticionRutear(BaseModel):
     costo_fijo: float = 0
     costo_km: float = 0
     api_key_ors: str | None = None
+
+
+class PeticionPlanificar(BaseModel):
+    """Reparto y orden en un solo cálculo. Ver `motor_ruteo/planificar.py`."""
+    tiendas: list[Tienda]
+    flota: list[TipoVehiculo]
+    cd_lat: float
+    cd_lon: float
+    motor: Literal["osrm", "haversine"] = "osrm"
+    cerrado: bool = True
+    hora_salida: str = "08:00"
+    servicio_min: float = 10
+    servicio_min_bulto: float = 0
+    jornada_h: float = 8
+    costo_fijo: float = 0
+    costo_km: float = 0
+    # Segundos que se le dan al solver para mejorar. El puente de la web corta
+    # a los 115, y después todavía hay que pedir el trazado de cada ruta.
+    tiempo_s: int = Field(20, ge=3, le=75)
 
 
 class PeticionSector(BaseModel):
@@ -365,6 +386,137 @@ def rutear(p: PeticionRutear):
             "duracion_min": round(sum(r["duracion_min"] for r in validas), 1),
             "costo": round(sum(r.get("costo", 0) for r in validas), 2),
             "paradas": sum(len(r.get("paradas", [])) for r in validas),
+        },
+    })
+
+
+@app.post("/planificar")
+def planificar(p: PeticionPlanificar):
+    """Reparte las tiendas entre la flota y ordena cada ruta, todo a la vez.
+
+    Devuelve lo que devolvían `/agrupar` y `/rutear` juntos, con las mismas
+    formas, para que la web pueda guardar el resultado sin distinguir de dónde
+    vino. Lo nuevo es `motivos`: por qué quedó fuera cada tienda sin asignar."""
+    if not p.flota:
+        raise HTTPException(400, "Define al menos un tipo de vehículo.")
+    df = _a_dataframe(p.tiendas).reset_index(drop=True)
+    flota = _expandir_flota(p.flota)
+    if len(flota) > 300:
+        raise HTTPException(400, "Máximo 300 vehículos por planificación.")
+
+    salida_s = hora_a_segundos(p.hora_salida) or 8 * 3600
+    jornada_s = int(p.jornada_h * 3600)
+    bultos = df["cantidad_bultos"].values.astype(float)
+    servicio = p.servicio_min * 60 + bultos * p.servicio_min_bulto * 60
+    ventanas = [
+        (int(a), int(b)) if pd.notna(a) and pd.notna(b) and b > a else None
+        for a, b in zip(df["ventana_ini_s"], df["ventana_fin_s"])
+    ]
+
+    try:
+        res = planificar_flota(
+            df[["latitud", "longitud"]].values.astype(float),
+            bultos, servicio, ventanas, df["prioridad"].values.astype(int), flota,
+            p.cd_lat, p.cd_lon,
+            motor=p.motor, cerrado=p.cerrado, salida_s=salida_s, jornada_s=jornada_s,
+            tiempo_seg=p.tiempo_s, costo_fijo=p.costo_fijo, costo_km=p.costo_km,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"No se pudo planificar: {type(e).__name__}: {e}")
+
+    por_calles = res["matriz"] == "calles"
+    aviso_matriz = None
+    if p.motor == "osrm" and not por_calles:
+        aviso_matriz = (
+            f"Con {len(df)} puntos no se puede pedir la matriz por calles al servidor "
+            "público: el reparto se decidió con distancias estimadas (línea recta por "
+            "1,4). Los kilómetros y el trazado de cada ruta sí son por calles."
+        )
+
+    grupos, rutas = [], []
+    for i, r in enumerate(res["rutas"]):
+        sub = df.iloc[r["orden"]]
+        paradas = [{
+            "id": str(sub.iloc[n]["id"]),
+            "orden": n + 1,
+            "codigo": _texto(sub.iloc[n]["codigo_sucursal"]) or "",
+            "nombre": _texto(sub.iloc[n]["name_sucursal"]) or "",
+            "distrito": _texto(sub.iloc[n]["distrito"]),
+            "bultos": int(sub.iloc[n]["cantidad_bultos"]),
+            "prioridad": int(sub.iloc[n]["prioridad"]),
+            "lat": float(sub.iloc[n]["latitud"]),
+            "lon": float(sub.iloc[n]["longitud"]),
+            "eta": segundos_a_hora(r["llegadas"].get(t)),
+        } for n, t in enumerate(r["orden"])]
+
+        coords_orden = ([(p.cd_lat, p.cd_lon)]
+                        + [(x["lat"], x["lon"]) for x in paradas]
+                        + ([(p.cd_lat, p.cd_lon)] if p.cerrado else []))
+
+        # El trazado y los kilómetros, por calles reales si se pidió y se puede.
+        km = r["dist_m"] / 1000.0
+        geometria = coords_orden
+        motor_txt = "Planificador · " + ("OSRM (calles reales)" if por_calles else "línea recta ×1,4")
+        if p.motor == "osrm":
+            try:
+                puntos, dist_real, _ = osrm_ruta_orden(
+                    tuple((lon, lat) for lat, lon in coords_orden))
+                geometria, km = puntos, dist_real / 1000.0
+                motor_txt = "Planificador · OSRM (calles reales)"
+            except Exception:
+                pass  # sin trazado: se dibuja en línea recta y se sigue
+
+        cap, mt = r["vehiculo"]
+        rutas.append({
+            "indice": i,
+            "paradas": paradas,
+            "orden": [x["id"] for x in paradas],
+            "km": round(km, 2),
+            "duracion_min": round((r["fin_s"] - salida_s) / 60.0, 1),
+            "bultos": int(sub["cantidad_bultos"].sum()),
+            "costo": round(p.costo_fijo + km * p.costo_km, 2),
+            "salida": segundos_a_hora(salida_s),
+            "fin": segundos_a_hora(r["fin_s"]),
+            "motor": motor_txt,
+            "aviso": aviso_matriz,
+            "geometria": [[float(la), float(lo)] for la, lo in geometria],
+            "links_maps": links_google_maps(coords_orden),
+        })
+        grupos.append({
+            "indice": i,
+            "tiendas": [x["id"] for x in paradas],
+            "n_tiendas": len(paradas),
+            "bultos": int(sub["cantidad_bultos"].sum()),
+            "prioritarias": int((sub["prioridad"] > 0).sum()),
+            "capacidad_vehiculo": int(cap),
+            "max_tiendas_vehiculo": int(mt),
+            "vuelta": 1,
+            "centro": {
+                "lat": float(sub["latitud"].mean()),
+                "lon": float(sub["longitud"].mean()),
+            },
+        })
+
+    motivos = {str(df.iloc[t]["id"]): m for t, m in res["sin_asignar"].items()}
+    return _sin_nan({
+        "grupos": grupos,
+        "rutas": rutas,
+        "sin_asignar": list(motivos.keys()),
+        "motivos": motivos,
+        "totales": {
+            "rutas": len(rutas),
+            "km": round(sum(r["km"] for r in rutas), 2),
+            "duracion_min": round(sum(r["duracion_min"] for r in rutas), 1),
+            "costo": round(sum(r["costo"] for r in rutas), 2),
+            "paradas": sum(len(r["paradas"]) for r in rutas),
+        },
+        "resumen": {
+            "tiendas": int(len(df)),
+            "vehiculos_disponibles": len(flota),
+            "vehiculos_usados": len(rutas),
+            "sin_asignar": len(motivos),
+            "matriz": res["matriz"],
+            "desde_agrupacion": bool(res["desde_agrupacion"]),
         },
     })
 
