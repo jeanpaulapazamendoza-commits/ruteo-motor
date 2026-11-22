@@ -35,6 +35,7 @@ from motor_ruteo import (
 from motor_ruteo import calles as calles_osrm
 from motor_ruteo.insertar import insertar_en_rutas
 from motor_ruteo.planificar import planificar_flota
+from motor_ruteo.reordenar import reordenar_ruta
 from sklearn.cluster import KMeans, MiniBatchKMeans
 
 app = FastAPI(
@@ -185,6 +186,30 @@ class PeticionInsertar(BaseModel):
     # Retocar el orden de las rutas que reciban algo. Las demás nunca se tocan.
     reordenar: bool = False
     peso_prioridad: float = Field(1, ge=0, le=5)
+
+
+class PeticionReordenar(BaseModel):
+    """Lo que le queda a una ruta, para ordenarlo. Ver `motor_ruteo/reordenar.py`."""
+    # Las paradas pendientes, en su orden actual.
+    paradas: list[Tienda]
+    # De dónde parte el vehículo y a qué hora.
+    lat: float
+    lon: float
+    hora: str = Field(description="HH:MM, en la zona de la operación")
+    # El centro al que vuelve, si `final` es 'centro'.
+    centro_lat: float | None = None
+    centro_lon: float | None = None
+    # Dónde termina: de vuelta en el centro, en una parada, o donde caiga.
+    final: Literal["centro", "parada", "libre"] = "centro"
+    final_id: str | None = None
+    # Cuántas de las primeras no se mueven.
+    fijas: int = Field(0, ge=0)
+    motor: Literal["osrm", "haversine"] = "osrm"
+    servicio_min: float = 10
+    servicio_min_bulto: float = 0
+    # False = no cambia el orden: solo dice cuánto recorre y a qué hora llega.
+    optimizar: bool = True
+    tiempo_s: int = Field(5, ge=1, le=30)
 
 
 class PeticionSector(BaseModel):
@@ -723,6 +748,62 @@ def insertar(p: PeticionInsertar):
             "rutas_tocadas": len(res["rutas"]),
             "matriz": res["matriz"],
         },
+    })
+
+
+@app.post("/reordenar")
+def reordenar(p: PeticionReordenar):
+    """Ordena lo que le queda a una ruta, o evalúa el orden que se le da.
+
+    Devuelve el orden de antes y el propuesto con sus horas, kilómetros y las
+    paradas que llegarían fuera de su ventana. Si el orden que había ya era el
+    mejor, `cambio` es falso y los dos son el mismo."""
+    if not p.paradas:
+        raise HTTPException(400, "La ruta no tiene paradas pendientes.")
+    if len(p.paradas) > 300:
+        raise HTTPException(400, "Máximo 300 paradas por ruta.")
+    hora_s = hora_a_segundos(p.hora)
+    if hora_s is None:
+        raise HTTPException(400, "La hora no se entiende: se espera HH:MM.")
+
+    paradas = []
+    for t in p.paradas:
+        ini, fin = hora_a_segundos(t.ventana_ini), hora_a_segundos(t.ventana_fin)
+        bultos = max(0, int(t.bultos))
+        paradas.append({
+            "id": t.id, "lat": t.lat, "lon": t.lon,
+            "servicio_s": p.servicio_min * 60 + bultos * p.servicio_min_bulto * 60,
+            "ventana": (ini, fin) if ini is not None and fin is not None and fin > ini else None,
+        })
+    if len({x["id"] for x in paradas}) != len(paradas):
+        raise HTTPException(400, "Hay paradas repetidas en la petición.")
+
+    centro = ((p.centro_lat, p.centro_lon)
+              if p.centro_lat is not None and p.centro_lon is not None else None)
+    try:
+        res = reordenar_ruta(
+            paradas, p.lat, p.lon, hora_s,
+            centro=centro, final=p.final, final_id=p.final_id, fijas=p.fijas,
+            motor=p.motor, optimizar=p.optimizar, tiempo_seg=p.tiempo_s,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"No se pudo reordenar: {type(e).__name__}: {e}")
+
+    def forma(r: dict) -> dict:
+        return {
+            "orden": r["orden"],
+            "etas": {k: segundos_a_hora(v) for k, v in r["llegadas"].items()},
+            "fin": segundos_a_hora(r["fin_s"]),
+            "min": round((r["fin_s"] - hora_s) / 60.0, 1),
+            "km": round(r["dist_m"] / 1000.0, 2),
+            "tarde": r["tarde"],
+        }
+
+    return _sin_nan({
+        "antes": forma(res["antes"]),
+        "despues": forma(res["despues"]),
+        "cambio": bool(res["cambio"]),
+        "matriz": res["matriz"],
     })
 
 

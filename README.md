@@ -23,6 +23,7 @@ Documentación interactiva en <http://localhost:8010/docs>.
 | POST | `/rutear` | Calcula la ruta óptima de cada grupo (OR-Tools) |
 | POST | `/planificar` | Reparte y ordena en un solo cálculo, con capacidad, ventanas y jornada como límites |
 | POST | `/insertar` | Busca el mejor hueco para pedidos nuevos en rutas que ya están en marcha |
+| POST | `/reordenar` | Ordena lo que le queda a una sola ruta, o evalúa el orden que se le da |
 | POST | `/tiendas-en-sector` | Qué tiendas caen dentro de un polígono del mapa |
 
 ### `/agrupar`
@@ -92,6 +93,25 @@ pendientes con `etas`, `km_extra` y `min_extra`; por cada pedido, su
 `inserciones` (ruta, posición, tras qué parada, hora); y `motivos` para lo
 que no encontró hueco. No usa el solver: prueba todos los huecos.
 
+### `/reordenar`
+
+Una ruta que ya existe y la pregunta «¿en qué orden conviene hacer lo que
+queda?».
+
+- `paradas[]` — las pendientes, en su orden actual.
+- `lat`, `lon`, `hora` — de dónde parte el vehículo y a qué hora.
+- `final` — `centro` (vuelve a `centro_lat`/`centro_lon`), `parada` (termina
+  en `final_id`) o `libre` (termina donde convenga).
+- `fijas` — cuántas de las primeras no se mueven.
+- `optimizar` — con `false` no cambia nada: solo dice cuánto recorre y a qué
+  hora llega el orden dado. Es lo que se usa cuando el orden lo pone una
+  persona a mano.
+
+Las ventanas horarias se priorizan pero no bloquean: un minuto de retraso
+pesa como 3,6 km de rodeo. Devuelve `antes` y `despues` con `orden`, `etas`,
+`km`, `fin` y las paradas que llegarían `tarde`; `cambio` es falso si el
+orden que había ya era el mejor.
+
 ## Servidor de calles
 
 Las distancias y tiempos por calles salen de OSRM. Sin configurar nada se usa
@@ -123,8 +143,8 @@ python extraer_motor.py
 
 Reescribe `motor_ruteo/*.py` quitando los decoradores de Streamlit
 (`@st.cache_data` → `@lru_cache`). No edites esos archivos a mano.
-`planificar.py`, `calles.py` e `insertar.py` no vienen de Streamlit: son de
-este servicio y la extracción no los toca.
+`planificar.py`, `calles.py`, `insertar.py` y `reordenar.py` no vienen de
+Streamlit: son de este servicio y la extracción no los toca.
 
 ## Despliegue
 
