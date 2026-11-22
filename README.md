@@ -103,6 +103,8 @@ queda?».
 - `final` — `centro` (vuelve a `centro_lat`/`centro_lon`), `parada` (termina
   en `final_id`) o `libre` (termina donde convenga).
 - `fijas` — cuántas de las primeras no se mueven.
+- `ancladas` — ids de paradas que conservan el puesto que tienen: la tercera
+  sigue siendo la tercera y las demás se ordenan a su alrededor.
 - `optimizar` — con `false` no cambia nada: solo dice cuánto recorre y a qué
   hora llega el orden dado. Es lo que se usa cuando el orden lo pone una
   persona a mano.
