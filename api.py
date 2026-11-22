@@ -24,12 +24,15 @@ from motor_ruteo import (
     kmeans_balanceado,
     links_google_maps,
     osrm_ruta_orden,
-    planificar_flota,
     proyectar_metros,
     puntos_en_poligono,
     rutear_cluster_ortools,
     segundos_a_hora,
 )
+# Estos dos no salen de la app de Streamlit: se importan por su nombre para que
+# volver a extraer el motor (que reescribe __init__.py) no los deje fuera.
+from motor_ruteo import calles as calles_osrm
+from motor_ruteo.planificar import planificar_flota
 from sklearn.cluster import KMeans, MiniBatchKMeans
 
 app = FastAPI(
@@ -193,7 +196,14 @@ def _expandir_flota(flota: list[TipoVehiculo]) -> tuple:
 # ===========================================================
 @app.get("/salud")
 def salud():
-    return {"estado": "ok", "motor": "OR-Tools + OSRM"}
+    # Qué servidor de calles está en uso y hasta cuántos puntos llega: sirve
+    # para comprobar desde fuera que la configuración surtió efecto.
+    return {
+        "estado": "ok",
+        "motor": "OR-Tools + OSRM",
+        "calles": "propio" if calles_osrm.ES_PROPIO else "publico",
+        "max_puntos_calles": calles_osrm.max_puntos_por_calles(),
+    }
 
 
 @app.post("/agrupar")

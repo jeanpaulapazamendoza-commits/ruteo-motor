@@ -31,7 +31,8 @@ from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 from .clustering import asignar_flota
 from .geo import matriz_haversine, proyectar_metros
-from .ruteo import OSRM_MAX_PUNTOS, VEL_PROMEDIO_KMH, osrm_tabla
+from .calles import cabe_por_calles, tabla_calles
+from .ruteo import VEL_PROMEDIO_KMH
 
 # Cuánto «cuesta» dejar una tienda sin visitar, en metros de recorrido. Tiene
 # que ser mucho mayor que cualquier rodeo razonable, o el solver preferiría
@@ -60,15 +61,16 @@ MOTIVO_SIN_HUECO = "No cupo en ninguna ruta sin pasarse de la jornada, de la cap
 def _matrices(coords_latlon, motor):
     """Distancias (m) y duraciones (s) entre todos los puntos; el 0 es el centro.
 
-    Por calles reales mientras quepa en una sola consulta al OSRM público. Con
-    más puntos no se puede pedir la matriz entera, y se estima: línea recta por
-    el factor de rodeo, a la velocidad media urbana. Devuelve también cuál de
-    las dos se usó, para poder decirlo."""
+    Por calles reales mientras el servidor de calles dé la matriz a tiempo
+    (ver `calles.py`: el público llega a unos 400 puntos, el propio a los que
+    se le configuren). Si no, se estima: línea recta por el factor de rodeo, a
+    la velocidad media urbana. Devuelve también cuál de las dos se usó, para
+    poder decirlo."""
     n = len(coords_latlon)
-    if motor == "osrm" and n <= OSRM_MAX_PUNTOS:
+    if motor == "osrm" and cabe_por_calles(n):
         try:
             lonlat = tuple((float(lon), float(lat)) for lat, lon in coords_latlon)
-            dist, dur = osrm_tabla(lonlat)
+            dist, dur = tabla_calles(lonlat)
             return np.asarray(dist, dtype=float), np.asarray(dur, dtype=float), "calles"
         except Exception:
             pass  # el servidor público falla a veces: mejor estimar que no planificar
