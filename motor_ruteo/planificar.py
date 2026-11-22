@@ -17,7 +17,11 @@ lleva cada tienda y en qué orden, cumpliendo en el mismo cálculo
   * la capacidad en bultos de cada vehículo,
   * su máximo de paradas,
   * las ventanas horarias y el tiempo de servicio,
-  * la jornada máxima, que deja de ser un aviso y pasa a ser un límite.
+  * la jornada máxima, que deja de ser un aviso y pasa a ser un límite,
+  * lo que cada pedido exige del vehículo (etiquetas: refrigerado, moto…).
+
+Y, sin ser límites, dos preferencias que se pueden graduar: que las tiendas
+prioritarias se visiten antes, y que las rutas queden parejas.
 
 Lo que no cabe no se fuerza: queda sin asignar, y se dice por qué.
 
@@ -56,6 +60,26 @@ MOTIVO_VENTANA_TARDE = "Su ventana horaria abre cuando la jornada ya terminó."
 MOTIVO_JORNADA = "Ir, atenderla y volver no cabe en la jornada ni con un vehículo para ella sola."
 MOTIVO_FLOTA = "La flota no alcanza: la carga total supera la capacidad de todos los vehículos."
 MOTIVO_SIN_HUECO = "No cupo en ninguna ruta sin pasarse de la jornada, de la capacidad o de una ventana horaria."
+MOTIVO_CAPACIDAD_ETIQUETA = "Su pedido no cabe en ninguno de los vehículos que tienen lo que pide."
+
+# Prioridad blanda: lo que cuesta, en metros de recorrido, cada segundo que
+# una tienda prioritaria espera a ser visitada. A 25 km/h un vehículo hace
+# unos 7 m por segundo, así que con 2 una hora de espera pesa como 7 km de
+# rodeo: se adelanta si el desvío es razonable, no a cualquier precio.
+PRIORIDAD_M_POR_S = 2.0
+# Los niveles por encima de 3 no pesan más: son para ordenar, no para romper.
+PRIORIDAD_NIVEL_MAX = 3
+
+# Balanceo: lo que cuesta, en metros, alargar la ruta más larga un segundo o
+# una parada. Bajo a propósito: empareja las rutas que salen, sin llegar a
+# sacar un vehículo más solo para que queden iguales.
+BALANCEO_M_POR_S = 1
+BALANCEO_M_POR_PARADA = 1000
+
+
+def _motivo_etiqueta(faltan):
+    lista = ", ".join(f"«{e}»" for e in sorted(faltan))
+    return f"Pide {lista} y ningún vehículo de la flota lo tiene."
 
 
 def _matrices(coords_latlon, motor):
@@ -80,7 +104,7 @@ def _matrices(coords_latlon, motor):
 
 
 def _descartar_imposibles(dist, dur, demanda, servicio, ventanas, caps,
-                          salida_s, jornada_s, cerrado):
+                          salida_s, jornada_s, cerrado, compatibles=None):
     """Las tiendas que ninguna planificación podría atender, con su motivo.
 
     Se apartan antes de construir el modelo por dos razones: el modelo queda
@@ -91,7 +115,14 @@ def _descartar_imposibles(dist, dur, demanda, servicio, ventanas, caps,
     fin_jornada = salida_s + jornada_s if jornada_s > 0 else None
     for i in range(1, len(dist)):
         t = i - 1
-        if demanda[t] > cap_max:
+        if compatibles is not None:
+            if not compatibles[t]:
+                continue  # ya tiene su motivo: ningún vehículo con lo que pide
+            cap_suya = max(caps[v] for v in compatibles[t])
+            if demanda[t] > cap_suya:
+                motivos[t] = MOTIVO_CAPACIDAD if cap_suya == cap_max else MOTIVO_CAPACIDAD_ETIQUETA
+                continue
+        elif demanda[t] > cap_max:
             motivos[t] = MOTIVO_CAPACIDAD
             continue
         llegada = salida_s + dur[0][i]
@@ -149,16 +180,24 @@ def _rutas_iniciales(coords_tiendas, demanda, prioridad, flota, dist):
 
 def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flota,
                      cd_lat, cd_lon, *, motor="osrm", cerrado=True, salida_s=8 * 3600,
-                     jornada_s=8 * 3600, tiempo_seg=20, costo_fijo=0.0, costo_km=0.0):
+                     jornada_s=8 * 3600, tiempo_seg=20, costo_fijo=0.0, costo_km=0.0,
+                     etiquetas_tienda=None, etiquetas_vehiculo=None,
+                     peso_prioridad=1.0, balanceo="ninguno"):
     """Reparte y ordena todas las tiendas entre la flota en un solo cálculo.
 
     coords_tiendas: array (n, 2) de [lat, lon].
     demanda, servicio, prioridad: una entrada por tienda (bultos, segundos, nivel).
     ventanas: una entrada por tienda, `(ini_s, fin_s)` o None.
     flota: lista de `(capacidad_bultos, max_tiendas)`, una por vehículo; 0 = sin límite.
+    etiquetas_tienda: por tienda, lo que exige del vehículo (conjunto de textos).
+    etiquetas_vehiculo: por vehículo, lo que tiene. Una tienda solo puede ir en
+        un vehículo que tenga todas sus etiquetas.
+    peso_prioridad: cuánto se adelanta a las prioritarias. 0 = nada (solo son
+        las últimas en quedarse fuera); 1 = normal; más = con más empeño.
+    balanceo: 'ninguno', 'tiempo' (rutas de duración pareja) o 'paradas'.
 
     Devuelve un dict con:
-      rutas        lista de {vehiculo, orden, llegadas, fin_s, dist_m}
+      rutas        lista de {vehiculo, vehiculo_idx, orden, llegadas, fin_s, dist_m}
                    (`orden` son posiciones de tienda; `llegadas` va por posición)
       sin_asignar  {posición de tienda: motivo}
       matriz       'calles' o 'recta'
@@ -175,8 +214,30 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
     dist, dur, matriz = _matrices(coords, motor)
 
     caps = [c for c, _ in flota]
+
+    # Qué vehículos puede usar cada tienda. Sin etiquetas, todos.
+    pide = [set(e) for e in etiquetas_tienda] if etiquetas_tienda is not None else [set()] * n
+    tiene = ([set(e) for e in etiquetas_vehiculo] if etiquetas_vehiculo is not None
+             else [set()] * len(flota))
+    compatibles = None
+    sin_vehiculo = {}
+    if any(pide):
+        todas = set().union(*tiene) if tiene else set()
+        compatibles = []
+        for t in range(n):
+            if not pide[t]:
+                compatibles.append(list(range(len(flota))))
+                continue
+            aptos = [v for v in range(len(flota)) if pide[t] <= tiene[v]]
+            compatibles.append(aptos)
+            if not aptos:
+                # Si cada etiqueta existe pero en vehículos distintos, faltan
+                # todas juntas; si alguna no existe, se nombra esa.
+                sin_vehiculo[t] = _motivo_etiqueta((pide[t] - todas) or pide[t])
+
     motivos = _descartar_imposibles(dist, dur, demanda, servicio, ventanas, caps,
-                                    salida_s, jornada_s, cerrado)
+                                    salida_s, jornada_s, cerrado, compatibles)
+    motivos.update(sin_vehiculo)
     vivas = [t for t in range(n) if t not in motivos]
     if not vivas:
         return {"rutas": [], "sin_asignar": motivos, "matriz": matriz,
@@ -243,11 +304,29 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
         tiempo.CumulVar(modelo.End(v)).SetMax(fin_max)
         modelo.AddVariableMinimizedByFinalizer(tiempo.CumulVar(modelo.End(v)))
 
+    # Rutas parejas: se cobra por la más larga, en tiempo o en paradas.
+    if balanceo == "tiempo":
+        tiempo.SetGlobalSpanCostCoefficient(BALANCEO_M_POR_S)
+    elif balanceo == "paradas":
+        modelo.GetDimensionOrDie("Paradas").SetGlobalSpanCostCoefficient(BALANCEO_M_POR_PARADA)
+
     for pos, t in enumerate(vivas, start=1):
         idx = gestor.NodeToIndex(pos)
         v = ventanas[t]
         if v is not None:
             tiempo.CumulVar(idx).SetRange(int(max(v[0], salida_s)), int(min(v[1], fin_max)))
+        if compatibles is not None and len(compatibles[t]) < V:
+            # -1 es «sin visitar»: tiene que seguir permitido, o la tienda
+            # dejaría de poder quedarse fuera.
+            modelo.VehicleVar(idx).SetValues([-1] + list(compatibles[t]))
+        # Prioridad blanda: cada segundo que pasa antes de visitarla cuesta.
+        # Se cuenta desde lo más pronto que se puede llegar, para no cobrar
+        # una espera que ninguna ruta podría evitar.
+        if prioridad[t] > 0 and peso_prioridad > 0:
+            pronto = int(max(salida_s + T[0][pos], v[0] if v is not None else 0))
+            coef = max(1, int(round(
+                PRIORIDAD_M_POR_S * peso_prioridad * min(prioridad[t], PRIORIDAD_NIVEL_MAX))))
+            tiempo.SetCumulVarSoftUpperBound(idx, min(pronto, fin_max), coef)
         # Lo que no cabe se puede dejar fuera, pagando. Sin esto, una sola
         # tienda imposible dejaría el problema entero sin solución.
         castigo = PENALIZACION_M * (FACTOR_PRIORIDAD if prioridad[t] > 0 else 1)
@@ -271,6 +350,11 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
         coords_tiendas[vivas], [demanda[t] for t in vivas],
         [prioridad[t] for t in vivas], flota, D)
     if semilla is not None:
+        if compatibles is not None:
+            # La agrupación no sabe de etiquetas: lo que cayó en un vehículo
+            # que no lo puede llevar se saca, y el solver le busca sitio.
+            semilla = [[p for p in ruta if v in compatibles[vivas[p]]]
+                       for v, ruta in enumerate(semilla)]
         modelo.CloseModelWithParameters(params)
         rutas_idx = [[gestor.NodeToIndex(p + 1) for p in ruta] for ruta in semilla]
         inicial = modelo.ReadAssignmentFromRoutes(rutas_idx, True)
@@ -308,6 +392,7 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
             continue  # vehículo que se queda en el centro
         rutas.append({
             "vehiculo": flota[v],
+            "vehiculo_idx": v,
             "orden": orden,
             "llegadas": llegadas,
             "fin_s": int(solucion.Value(tiempo.CumulVar(idx))),

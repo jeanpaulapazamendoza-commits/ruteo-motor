@@ -49,6 +49,18 @@ Respeta **ventanas horarias** y **prioridades** de cada tienda, y devuelve por
 ruta: paradas en orden con su ETA, km, duración, costo, geometría para el mapa
 y links de Google Maps por tramos.
 
+### `/planificar`
+
+Además de los parámetros de `/rutear`:
+
+- `flota[].etiquetas` y `tiendas[].etiquetas` — una tienda solo va en un
+  vehículo que tenga todas sus etiquetas.
+- `peso_prioridad` (0–5, por defecto 1) — cuánto se adelanta a las tiendas
+  prioritarias. 0 = solo son las últimas en quedarse fuera.
+- `balanceo` (`ninguno`, `tiempo`, `paradas`) — rutas parejas.
+
+Devuelve `motivos`: por qué quedó fuera cada tienda sin asignar.
+
 ## Servidor de calles
 
 Las distancias y tiempos por calles salen de OSRM. Sin configurar nada se usa

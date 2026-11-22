@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import unicodedata
 from typing import Literal
 
 import numpy as np
@@ -67,12 +68,16 @@ class Tienda(BaseModel):
     prioridad: int = 0
     ventana_ini: str | None = None
     ventana_fin: str | None = None
+    # Lo que el pedido exige del vehículo. Solo lo mira /planificar.
+    etiquetas: list[str] = []
 
 
 class TipoVehiculo(BaseModel):
     cantidad: int = Field(ge=1)
     capacidad: int = Field(gt=0, description="Bultos que carga")
     max_tiendas: int = Field(0, ge=0, description="0 = sin límite")
+    # Lo que tiene este tipo de vehículo: refrigerado, moto, rampa…
+    etiquetas: list[str] = []
 
 
 class PeticionAgrupar(BaseModel):
@@ -122,6 +127,10 @@ class PeticionPlanificar(BaseModel):
     # Segundos que se le dan al solver para mejorar. El puente de la web corta
     # a los 115, y después todavía hay que pedir el trazado de cada ruta.
     tiempo_s: int = Field(20, ge=3, le=75)
+    # 0 = las prioritarias solo son las últimas en quedarse fuera; 1 = además
+    # se visitan antes si el rodeo es razonable; más = con más empeño.
+    peso_prioridad: float = Field(1, ge=0, le=5)
+    balanceo: Literal["ninguno", "tiempo", "paradas"] = "ninguno"
 
 
 class PeticionSector(BaseModel):
@@ -173,7 +182,9 @@ def _a_dataframe(tiendas: list[Tienda]) -> pd.DataFrame:
         raise HTTPException(400, "No se recibió ninguna tienda.")
     if len(tiendas) > MAX_TIENDAS:
         raise HTTPException(400, f"Máximo {MAX_TIENDAS} tiendas por petición.")
-    df = pd.DataFrame([t.model_dump() for t in tiendas])
+    # Las etiquetas son listas y no caben en una celda con la que luego se
+    # agrupa o se compara: quien las necesita las lee de la petición.
+    df = pd.DataFrame([t.model_dump(exclude={"etiquetas"}) for t in tiendas])
     df["cantidad_bultos"] = df["bultos"].astype(float).clip(lower=0)
     df["name_sucursal"] = df["nombre"]
     df["codigo_sucursal"] = df["codigo"]
@@ -189,6 +200,20 @@ def _expandir_flota(flota: list[TipoVehiculo]) -> tuple:
     for t in flota:
         lista.extend([(t.capacidad, t.max_tiendas)] * t.cantidad)
     return tuple(lista)
+
+
+def _etiquetas(lista) -> frozenset:
+    """Etiquetas comparables: sin mayúsculas, tildes ni espacios sobrantes.
+
+    «Refrigerado », «refrigerado» y «REFRIGERADO» tienen que ser la misma: una
+    viene del archivo del cliente y la otra la escribe quien planifica."""
+    limpias = set()
+    for e in lista or []:
+        t = unicodedata.normalize("NFKD", str(e)).encode("ascii", "ignore").decode()
+        t = " ".join(t.lower().split())
+        if t:
+            limpias.add(t)
+    return frozenset(limpias)
 
 
 # ===========================================================
@@ -423,6 +448,13 @@ def planificar(p: PeticionPlanificar):
         for a, b in zip(df["ventana_ini_s"], df["ventana_fin_s"])
     ]
 
+    # Las etiquetas van en el mismo orden que las tiendas y que los vehículos
+    # de la flota ya desplegada.
+    pide = [_etiquetas(t.etiquetas) for t in p.tiendas]
+    tiene = []
+    for tipo in p.flota:
+        tiene.extend([_etiquetas(tipo.etiquetas)] * tipo.cantidad)
+
     try:
         res = planificar_flota(
             df[["latitud", "longitud"]].values.astype(float),
@@ -430,6 +462,8 @@ def planificar(p: PeticionPlanificar):
             p.cd_lat, p.cd_lon,
             motor=p.motor, cerrado=p.cerrado, salida_s=salida_s, jornada_s=jornada_s,
             tiempo_seg=p.tiempo_s, costo_fijo=p.costo_fijo, costo_km=p.costo_km,
+            etiquetas_tienda=pide, etiquetas_vehiculo=tiene,
+            peso_prioridad=p.peso_prioridad, balanceo=p.balanceo,
         )
     except Exception as e:
         raise HTTPException(500, f"No se pudo planificar: {type(e).__name__}: {e}")
@@ -500,6 +534,7 @@ def planificar(p: PeticionPlanificar):
             "prioritarias": int((sub["prioridad"] > 0).sum()),
             "capacidad_vehiculo": int(cap),
             "max_tiendas_vehiculo": int(mt),
+            "etiquetas_vehiculo": sorted(tiene[r["vehiculo_idx"]]),
             "vuelta": 1,
             "centro": {
                 "lat": float(sub["latitud"].mean()),
@@ -527,6 +562,9 @@ def planificar(p: PeticionPlanificar):
             "sin_asignar": len(motivos),
             "matriz": res["matriz"],
             "desde_agrupacion": bool(res["desde_agrupacion"]),
+            "balanceo": p.balanceo,
+            "peso_prioridad": p.peso_prioridad,
+            "con_etiquetas": sum(1 for e in pide if e),
         },
     })
 
