@@ -18,7 +18,10 @@ lleva cada tienda y en qué orden, cumpliendo en el mismo cálculo
   * su máximo de paradas,
   * las ventanas horarias y el tiempo de servicio,
   * la jornada máxima, que deja de ser un aviso y pasa a ser un límite,
-  * lo que cada pedido exige del vehículo (etiquetas: refrigerado, moto…).
+  * lo que cada pedido exige del vehículo (etiquetas: refrigerado, moto…),
+  * la base de la que sale cada vehículo, cuando la flota está repartida
+    entre varios centros: cada tienda acaba en el vehículo —y por tanto en
+    el centro— que mejor la atiende.
 
 Y, sin ser límites, dos preferencias que se pueden graduar: que las tiendas
 prioritarias se visiten antes, y que las rutas queden parejas.
@@ -104,17 +107,23 @@ def _matrices(coords_latlon, motor):
 
 
 def _descartar_imposibles(dist, dur, demanda, servicio, ventanas, caps,
-                          salida_s, jornada_s, cerrado, compatibles=None):
+                          salida_s, jornada_s, cerrado, compatibles=None,
+                          base_vehiculo=None, n_bases=1):
     """Las tiendas que ninguna planificación podría atender, con su motivo.
 
     Se apartan antes de construir el modelo por dos razones: el modelo queda
     más pequeño, y el motivo se puede decir con exactitud. Si se dejaran
-    dentro, el solver las abandonaría igual pero sin explicar nada."""
+    dentro, el solver las abandonaría igual pero sin explicar nada.
+
+    Con varias bases, una tienda solo es imposible si lo es desde todas las
+    bases de los vehículos que la pueden llevar."""
     motivos = {}
     cap_max = max(caps)
     fin_jornada = salida_s + jornada_s if jornada_s > 0 else None
-    for i in range(1, len(dist)):
-        t = i - 1
+    if base_vehiculo is None:
+        base_vehiculo = [0] * len(caps)
+    for i in range(n_bases, len(dist)):
+        t = i - n_bases
         if compatibles is not None:
             if not compatibles[t]:
                 continue  # ya tiene su motivo: ningún vehículo con lo que pide
@@ -125,7 +134,10 @@ def _descartar_imposibles(dist, dur, demanda, servicio, ventanas, caps,
         elif demanda[t] > cap_max:
             motivos[t] = MOTIVO_CAPACIDAD
             continue
-        llegada = salida_s + dur[0][i]
+        # Las bases desde las que puede salir un vehículo apto para ella.
+        aptos = compatibles[t] if compatibles is not None else range(len(caps))
+        bases = sorted({base_vehiculo[v] for v in aptos})
+        llegada = salida_s + min(dur[b][i] for b in bases)
         v = ventanas[t]
         if v is not None:
             if v[1] < llegada:
@@ -134,21 +146,37 @@ def _descartar_imposibles(dist, dur, demanda, servicio, ventanas, caps,
             if fin_jornada is not None and v[0] > fin_jornada:
                 motivos[t] = MOTIVO_VENTANA_TARDE
                 continue
-            llegada = max(llegada, v[0])
         if fin_jornada is not None:
-            vuelta = dur[i][0] if cerrado else 0.0
-            if llegada + servicio[t] + vuelta > fin_jornada:
+            cabe = False
+            for b in bases:
+                lleg = salida_s + dur[b][i]
+                if v is not None:
+                    if lleg > v[1]:
+                        continue
+                    lleg = max(lleg, v[0])
+                vuelta = dur[i][b] if cerrado else 0.0
+                if lleg + servicio[t] + vuelta <= fin_jornada:
+                    cabe = True
+                    break
+            if not cabe:
                 motivos[t] = MOTIVO_JORNADA
     return motivos
 
 
-def _rutas_iniciales(coords_tiendas, demanda, prioridad, flota, dist):
+def _rutas_iniciales(coords_tiendas, demanda, prioridad, flota, dist,
+                     base_vehiculo=None, n_bases=1):
     """El punto de partida: la agrupación de siempre, convertida en rutas.
 
     Devuelve una lista con una ruta por vehículo (posiciones de tienda, en el
     orden del vecino más cercano). Un vehículo sin grupo lleva la lista vacía.
     Si la agrupación falla por lo que sea, no hay punto de partida y el solver
-    empieza de cero: es más lento, no incorrecto."""
+    empieza de cero: es más lento, no incorrecto.
+
+    La agrupación no sabe de bases: reparte por cercanía entre tiendas. Con
+    varias, cada grupo se le da al vehículo de su tipo cuya base le queda más
+    cerca."""
+    if base_vehiculo is None:
+        base_vehiculo = [0] * len(flota)
     try:
         Xm = proyectar_metros(coords_tiendas[:, 0], coords_tiendas[:, 1])
         labels, info = asignar_flota(
@@ -162,18 +190,21 @@ def _rutas_iniciales(coords_tiendas, demanda, prioridad, flota, dist):
     rutas = [[] for _ in flota]
     for r, datos in info.items():
         tipo = (int(datos["capacidad"]), int(datos["max_tiendas"]))
-        # un vehículo de ese mismo tipo que todavía no tenga grupo
-        v = next((x for x in libres if (int(flota[x][0]), int(flota[x][1])) == tipo), None)
-        if v is None:
-            continue
-        libres.remove(v)
         pendientes = [int(i) for i in np.where(labels == r)[0]]
-        actual, orden = 0, []
+        # un vehículo de ese mismo tipo que todavía no tenga grupo: el de la
+        # base más cercana al grupo
+        aptos = [x for x in libres if (int(flota[x][0]), int(flota[x][1])) == tipo]
+        if not aptos or not pendientes:
+            continue
+        v = min(aptos, key=lambda x: (
+            sum(dist[base_vehiculo[x]][t + n_bases] for t in pendientes), x))
+        libres.remove(v)
+        actual, orden = base_vehiculo[v], []
         while pendientes:
-            sig = min(pendientes, key=lambda t: dist[actual][t + 1])
+            sig = min(pendientes, key=lambda t: dist[actual][t + n_bases])
             orden.append(sig)
             pendientes.remove(sig)
-            actual = sig + 1
+            actual = sig + n_bases
         rutas[v] = orden
     return rutas
 
@@ -182,7 +213,8 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
                      cd_lat, cd_lon, *, motor="osrm", cerrado=True, salida_s=8 * 3600,
                      jornada_s=8 * 3600, tiempo_seg=20, costo_fijo=0.0, costo_km=0.0,
                      etiquetas_tienda=None, etiquetas_vehiculo=None,
-                     peso_prioridad=1.0, balanceo="ninguno"):
+                     peso_prioridad=1.0, balanceo="ninguno",
+                     bases=None, base_vehiculo=None):
     """Reparte y ordena todas las tiendas entre la flota en un solo cálculo.
 
     coords_tiendas: array (n, 2) de [lat, lon].
@@ -195,9 +227,14 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
     peso_prioridad: cuánto se adelanta a las prioritarias. 0 = nada (solo son
         las últimas en quedarse fuera); 1 = normal; más = con más empeño.
     balanceo: 'ninguno', 'tiempo' (rutas de duración pareja) o 'paradas'.
+    bases: lista de `(lat, lon)` cuando la flota sale de varios centros. Sin
+        ella, todos salen de `(cd_lat, cd_lon)`.
+    base_vehiculo: por vehículo, la posición en `bases` de la suya. Cada
+        vehículo sale de su base y, si la ruta es cerrada, vuelve a ella.
 
     Devuelve un dict con:
-      rutas        lista de {vehiculo, vehiculo_idx, orden, llegadas, fin_s, dist_m}
+      rutas        lista de {vehiculo, vehiculo_idx, base_idx, orden, llegadas,
+                   fin_s, dist_m}
                    (`orden` son posiciones de tienda; `llegadas` va por posición)
       sin_asignar  {posición de tienda: motivo}
       matriz       'calles' o 'recta'
@@ -210,7 +247,26 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
     servicio = [float(s) for s in servicio]
     prioridad = [int(p) for p in prioridad]
 
-    coords = np.vstack([[cd_lat, cd_lon], coords_tiendas])
+    if not bases:
+        bases = [(cd_lat, cd_lon)]
+        base_vehiculo = None
+    bases = [(float(la), float(lo)) for la, lo in bases]
+    B = len(bases)
+    if base_vehiculo is None:
+        base_vehiculo = [0] * len(flota)
+    base_vehiculo = [int(b) for b in base_vehiculo]
+    if len(base_vehiculo) != len(flota) or any(not 0 <= b < B for b in base_vehiculo):
+        raise ValueError("Cada vehículo tiene que salir de una de las bases dadas.")
+    # Una base de la que no sale nadie no entra en el modelo: para el solver
+    # todo nodo que no es salida ni llegada de un vehículo es una parada que
+    # hay que visitar, y mandaría un vehículo hasta allí para nada.
+    base_dada = sorted(set(base_vehiculo))
+    bases = [bases[b] for b in base_dada]
+    base_vehiculo = [base_dada.index(b) for b in base_vehiculo]
+    B = len(bases)
+
+    # Los nodos 0..B-1 son las bases; después van las tiendas.
+    coords = np.vstack([np.asarray(bases, dtype=float), coords_tiendas])
     dist, dur, matriz = _matrices(coords, motor)
 
     caps = [c for c, _ in flota]
@@ -236,7 +292,8 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
                 sin_vehiculo[t] = _motivo_etiqueta((pide[t] - todas) or pide[t])
 
     motivos = _descartar_imposibles(dist, dur, demanda, servicio, ventanas, caps,
-                                    salida_s, jornada_s, cerrado, compatibles)
+                                    salida_s, jornada_s, cerrado, compatibles,
+                                    base_vehiculo, B)
     motivos.update(sin_vehiculo)
     vivas = [t for t in range(n) if t not in motivos]
     if not vivas:
@@ -244,16 +301,16 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
                 "desde_agrupacion": False}
 
     # ── El modelo trabaja sobre las tiendas posibles ───────────────────────
-    # Nodo 0 = centro; nodos 1..m = tiendas vivas; nodo m+1 = final fantasma,
-    # solo si la ruta es abierta (no vuelve al centro).
+    # Nodos 0..B-1 = bases; nodos B..B+m-1 = tiendas vivas; nodo B+m = final
+    # fantasma, solo si la ruta es abierta (no vuelve a su base).
     m = len(vivas)
     V = len(flota)
-    sub = [0] + [t + 1 for t in vivas]
+    sub = list(range(B)) + [t + B for t in vivas]
     D = dist[np.ix_(sub, sub)]
     T = dur[np.ix_(sub, sub)]
-    serv = [0.0] + [servicio[t] for t in vivas]
-    dem = [0] + [demanda[t] for t in vivas]
-    tam = m + 1
+    serv = [0.0] * B + [servicio[t] for t in vivas]
+    dem = [0] * B + [demanda[t] for t in vivas]
+    tam = B + m
 
     if not cerrado:
         D = np.pad(D, ((0, 1), (0, 1)))   # llegar al final fantasma no cuesta
@@ -261,9 +318,9 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
         serv.append(0.0)
         dem.append(0)
         tam += 1
-        gestor = pywrapcp.RoutingIndexManager(tam, V, [0] * V, [m + 1] * V)
+        gestor = pywrapcp.RoutingIndexManager(tam, V, base_vehiculo, [B + m] * V)
     else:
-        gestor = pywrapcp.RoutingIndexManager(tam, V, 0)
+        gestor = pywrapcp.RoutingIndexManager(tam, V, base_vehiculo, base_vehiculo)
     modelo = pywrapcp.RoutingModel(gestor)
 
     # Distancia: es lo que se minimiza.
@@ -283,7 +340,7 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
     modelo.AddDimensionWithVehicleCapacity(cb_carga, 0, caps, True, "Carga")
 
     # Máximo de paradas por vehículo.
-    una = [0] + [1] * m + ([0] if not cerrado else [])
+    una = [0] * B + [1] * m + ([0] if not cerrado else [])
     cb_paradas = modelo.RegisterUnaryTransitVector(una)
     modelo.AddDimensionWithVehicleCapacity(
         cb_paradas, 0, [mt if mt > 0 else m for _, mt in flota], True, "Paradas")
@@ -310,7 +367,7 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
     elif balanceo == "paradas":
         modelo.GetDimensionOrDie("Paradas").SetGlobalSpanCostCoefficient(BALANCEO_M_POR_PARADA)
 
-    for pos, t in enumerate(vivas, start=1):
+    for pos, t in enumerate(vivas, start=B):
         idx = gestor.NodeToIndex(pos)
         v = ventanas[t]
         if v is not None:
@@ -323,7 +380,9 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
         # Se cuenta desde lo más pronto que se puede llegar, para no cobrar
         # una espera que ninguna ruta podría evitar.
         if prioridad[t] > 0 and peso_prioridad > 0:
-            pronto = int(max(salida_s + T[0][pos], v[0] if v is not None else 0))
+            aptos = compatibles[t] if compatibles is not None else range(V)
+            cerca = min(T[base_vehiculo[x]][pos] for x in aptos)
+            pronto = int(max(salida_s + cerca, v[0] if v is not None else 0))
             coef = max(1, int(round(
                 PRIORIDAD_M_POR_S * peso_prioridad * min(prioridad[t], PRIORIDAD_NIVEL_MAX))))
             tiempo.SetCumulVarSoftUpperBound(idx, min(pronto, fin_max), coef)
@@ -348,7 +407,7 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
     desde_agrupacion = False
     semilla = _rutas_iniciales(
         coords_tiendas[vivas], [demanda[t] for t in vivas],
-        [prioridad[t] for t in vivas], flota, D)
+        [prioridad[t] for t in vivas], flota, D, base_vehiculo, B)
     if semilla is not None:
         if compatibles is not None:
             # La agrupación no sabe de etiquetas: lo que cayó en un vehículo
@@ -356,7 +415,7 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
             semilla = [[p for p in ruta if v in compatibles[vivas[p]]]
                        for v, ruta in enumerate(semilla)]
         modelo.CloseModelWithParameters(params)
-        rutas_idx = [[gestor.NodeToIndex(p + 1) for p in ruta] for ruta in semilla]
+        rutas_idx = [[gestor.NodeToIndex(p + B) for p in ruta] for ruta in semilla]
         inicial = modelo.ReadAssignmentFromRoutes(rutas_idx, True)
         # La agrupación no mira horas: puede romper una ventana o la jornada.
         # En ese caso no sirve como arranque y el solver construye la suya.
@@ -380,8 +439,8 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
         orden, llegadas, metros = [], {}, 0
         while not modelo.IsEnd(idx):
             nodo = gestor.IndexToNode(idx)
-            if 1 <= nodo <= m:
-                t = vivas[nodo - 1]
+            if B <= nodo < B + m:
+                t = vivas[nodo - B]
                 orden.append(t)
                 llegadas[t] = int(solucion.Value(tiempo.CumulVar(idx)))
                 atendidas.add(t)
@@ -393,6 +452,7 @@ def planificar_flota(coords_tiendas, demanda, servicio, ventanas, prioridad, flo
         rutas.append({
             "vehiculo": flota[v],
             "vehiculo_idx": v,
+            "base_idx": base_dada[base_vehiculo[v]],   # posición en las bases recibidas
             "orden": orden,
             "llegadas": llegadas,
             "fin_s": int(solucion.Value(tiempo.CumulVar(idx))),

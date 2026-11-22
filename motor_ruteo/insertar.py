@@ -63,10 +63,12 @@ MEJORA_MINIMA_M = 50.0
 
 
 class _Ruta:
-    def __init__(self, pos, datos, nodo_inicio, nodos):
+    def __init__(self, pos, datos, nodo_inicio, nodos, nodo_base, cerrado):
         self.pos = pos                      # posición en la lista de entrada
         self.id = datos["id"]
         self.inicio = nodo_inicio
+        self.base = nodo_base               # su centro: de ahí salió
+        self.fin = nodo_base if cerrado else None   # y ahí vuelve, si es cerrada
         self.hora = float(datos["hora_s"])
         self.seq = list(nodos)              # nodos de las paradas pendientes
         self.fijas = max(0, min(int(datos.get("fijas") or 0), len(self.seq)))
@@ -76,7 +78,7 @@ class _Ruta:
         self.etiquetas = None if etiquetas is None else set(etiquetas)
         self.orden_antes = list(nodos)
         self.nuevas = []
-        self.base = None                    # (llegadas, fin, dist) antes de tocarla
+        self.antes = None                   # (llegadas, fin, dist) antes de tocarla
         self.final = None                   # lo mismo, ya con lo insertado
         self.reordenada = False
 
@@ -93,9 +95,10 @@ class _Mapa:
         self.T = np.asarray(dur, dtype=float).tolist()
 
 
-def _recorrer(ruta, seq, mapa, serv, vent, fin_nodo):
+def _recorrer(ruta, seq, mapa, serv, vent):
     """Horas de llegada a cada parada de `seq`, hora de fin y metros."""
     D, T, loc = mapa.D, mapa.T, mapa.loc
+    fin_nodo = ruta.fin
     t = ruta.hora
     prev = loc[ruta.inicio]
     metros = 0.0
@@ -145,7 +148,7 @@ def _admisible(seq, llegadas, fin, antes, fin_antes, vent, fin_jornada):
     return True
 
 
-def _mejor_hueco(ruta, p, mapa, serv, vent, peso, bultos, pide, fin_nodo, fin_jornada):
+def _mejor_hueco(ruta, p, mapa, serv, vent, peso, bultos, pide, fin_jornada):
     """El hueco más barato de `ruta` para el pedido `p`.
 
     Devuelve (coste_extra, posición) o (None, por_qué_no)."""
@@ -156,7 +159,7 @@ def _mejor_hueco(ruta, p, mapa, serv, vent, peso, bultos, pide, fin_nodo, fin_jo
     if ruta.paradas_libres is not None and ruta.paradas_libres < 1:
         return None, "paradas"
 
-    lleg0, fin0, met0 = _recorrer(ruta, ruta.seq, mapa, serv, vent, fin_nodo)
+    lleg0, fin0, met0 = _recorrer(ruta, ruta.seq, mapa, serv, vent)
     antes = dict(zip(ruta.seq, lleg0))
     coste0 = _coste(ruta.seq, lleg0, met0, peso)
 
@@ -164,7 +167,7 @@ def _mejor_hueco(ruta, p, mapa, serv, vent, peso, bultos, pide, fin_nodo, fin_jo
     llega_a_tiempo = False
     for pos in range(ruta.fijas, len(ruta.seq) + 1):
         seq = ruta.seq[:pos] + [p] + ruta.seq[pos:]
-        lleg, fin, met = _recorrer(ruta, seq, mapa, serv, vent, fin_nodo)
+        lleg, fin, met = _recorrer(ruta, seq, mapa, serv, vent)
         v = vent[p]
         if v is None or lleg[pos] <= v[1] + 1e-6:
             llega_a_tiempo = True
@@ -178,13 +181,13 @@ def _mejor_hueco(ruta, p, mapa, serv, vent, peso, bultos, pide, fin_nodo, fin_jo
     return mejor
 
 
-def _reordenar(ruta, mapa, serv, vent, peso, fin_nodo, fin_jornada):
+def _reordenar(ruta, mapa, serv, vent, peso, fin_jornada):
     """Retoca el orden de las pendientes que se pueden mover.
 
     Dos movimientos, repetidos hasta que ninguno mejora: sacar una parada y
     meterla en otro sitio, e invertir un tramo. Solo se acepta lo que ahorra
     recorrido sin empeorar ninguna hora comprometida."""
-    lleg, fin_tope, met = _recorrer(ruta, ruta.seq, mapa, serv, vent, fin_nodo)
+    lleg, fin_tope, met = _recorrer(ruta, ruta.seq, mapa, serv, vent)
     antes = dict(zip(ruta.seq, lleg))
     coste = _coste(ruta.seq, lleg, met, peso)
     coste_inicial = coste
@@ -206,7 +209,7 @@ def _reordenar(ruta, mapa, serv, vent, peso, fin_nodo, fin_jornada):
             for j in range(i + 1, n):
                 candidatas.append(ruta.seq[:i] + ruta.seq[i:j + 1][::-1] + ruta.seq[j + 1:])
         for seq in candidatas:
-            lleg, fin, met = _recorrer(ruta, seq, mapa, serv, vent, fin_nodo)
+            lleg, fin, met = _recorrer(ruta, seq, mapa, serv, vent)
             c = _coste(seq, lleg, met, peso)
             if c < coste - 1.0 and _admisible(seq, lleg, fin, antes, fin_tope, vent, fin_jornada):
                 ruta.seq, coste, mejorado = seq, c, True
@@ -224,7 +227,9 @@ def insertar_en_rutas(rutas, nuevas, cd_lat, cd_lon, *, motor="osrm", cerrado=Tr
 
     rutas: lista de dicts con
         id          identificador de la ruta
-        lat, lon    dónde está el vehículo (None = en el centro)
+        lat, lon    dónde está el vehículo (None = en su centro)
+        base        `(lat, lon)` de su centro, si no es el común: de ahí sale
+                    y ahí vuelve
         hora_s      desde qué hora está libre en ese punto
         pendientes  paradas que le quedan, en su orden: dicts con id, lat,
                     lon, bultos, servicio_s, ventana `(ini_s, fin_s)` o None,
@@ -268,20 +273,27 @@ def insertar_en_rutas(rutas, nuevas, cd_lat, cd_lon, *, motor="osrm", cerrado=Tr
         return len(coords) - 1
 
     estado = []
+    nodo_de_base = {}
     for pos, r in enumerate(rutas):
+        # El centro de la ruta: el suyo si lo trae, o el común.
+        base = 0
+        if r.get("base") is not None:
+            clave = (round(float(r["base"][0]), 6), round(float(r["base"][1]), 6))
+            if clave not in nodo_de_base:
+                nodo_de_base[clave] = _nodo(*clave)
+            base = nodo_de_base[clave]
         if r.get("lat") is None or r.get("lon") is None:
-            inicio = 0
+            inicio = base
         else:
             inicio = _nodo(r["lat"], r["lon"])
         nodos = [_nodo(s["lat"], s["lon"], s) for s in r.get("pendientes", [])]
-        estado.append(_Ruta(pos, r, inicio, nodos))
+        estado.append(_Ruta(pos, r, inicio, nodos, base, cerrado))
     pedidos = [_nodo(p["lat"], p["lon"], p) for p in nuevas]
     coords = np.asarray(coords, dtype=float)
-    fin_nodo = 0 if cerrado else None
 
     # ── Qué rutas mira cada pedido, de la más cercana a la más lejana ───────
     def _cerca(p, r):
-        pts = [r.inicio] + r.seq + ([0] if cerrado else [])
+        pts = [r.inicio] + r.seq + ([r.base] if cerrado else [])
         d = coords[pts] - coords[p]
         d[:, 1] *= math.cos(math.radians(coords[p][0]))
         return float(np.min(np.hypot(d[:, 0], d[:, 1])))
@@ -290,7 +302,7 @@ def insertar_en_rutas(rutas, nuevas, cd_lat, cd_lon, *, motor="osrm", cerrado=Tr
     porque = {p: set() for p in pedidos}
     colocado = {}                           # pedido -> (ruta, metros extra)
     matrices = set()
-    args = (serv, vent, peso, bultos, pide, fin_nodo, fin_jornada_s)
+    args = (serv, vent, peso, bultos, pide, fin_jornada_s)
 
     faltan = list(pedidos)
     while faltan:
@@ -304,14 +316,15 @@ def insertar_en_rutas(rutas, nuevas, cd_lat, cd_lon, *, motor="osrm", cerrado=Tr
             cola[p] = cola[p][RUTAS_VECINAS:]
         if not tanda:
             break
-        nodos = sorted({0} | set(faltan) | {n for r in tanda for n in [r.inicio] + r.seq})
+        nodos = sorted({0} | set(faltan)
+                       | {n for r in tanda for n in [r.inicio, r.base] + r.seq})
         mapa = _Mapa(coords, nodos, motor)
         matrices.add(mapa.matriz)
         for r in tanda:
             # Una ruta puede volver en otra pasada, ya con algo dentro: su
             # punto de comparación es el de la primera vez.
-            if r.base is None:
-                r.base = _recorrer(r, r.seq, mapa, serv, vent, fin_nodo)
+            if r.antes is None:
+                r.antes = _recorrer(r, r.seq, mapa, serv, vent)
 
         # Primero el pedido que más pierde si no se le da su mejor ruta.
         hueco = {}
@@ -336,9 +349,9 @@ def insertar_en_rutas(rutas, nuevas, cd_lat, cd_lon, *, motor="osrm", cerrado=Tr
             if not opciones:
                 break
             *_, p, (_, _, pos, r) = max(opciones, key=lambda x: x[:4])
-            _, _, met0 = _recorrer(r, r.seq, mapa, serv, vent, fin_nodo)
+            _, _, met0 = _recorrer(r, r.seq, mapa, serv, vent)
             r.seq.insert(pos, p)
-            _, _, met1 = _recorrer(r, r.seq, mapa, serv, vent, fin_nodo)
+            _, _, met1 = _recorrer(r, r.seq, mapa, serv, vent)
             r.nuevas.append(p)
             if r.cap_libre is not None:
                 r.cap_libre -= bultos[p]
@@ -354,8 +367,8 @@ def insertar_en_rutas(rutas, nuevas, cd_lat, cd_lon, *, motor="osrm", cerrado=Tr
             if not r.nuevas:
                 continue
             r.reordenada = bool(reordenar) and _reordenar(
-                r, mapa, serv, vent, peso, fin_nodo, fin_jornada_s)
-            r.final = _recorrer(r, r.seq, mapa, serv, vent, fin_nodo)
+                r, mapa, serv, vent, peso, fin_jornada_s)
+            r.final = _recorrer(r, r.seq, mapa, serv, vent)
         faltan = [p for p in faltan if p not in colocado]
 
     # ── Respuesta ──────────────────────────────────────────────────────────
@@ -365,7 +378,7 @@ def insertar_en_rutas(rutas, nuevas, cd_lat, cd_lon, *, motor="osrm", cerrado=Tr
         if not r.nuevas:
             continue
         llegadas, fin, metros = r.final
-        _, fin_antes, metros_antes = r.base
+        _, fin_antes, metros_antes = r.antes
         salida_rutas.append({
             "id": r.id,
             "orden": [ident[n] for n in r.seq],

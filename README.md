@@ -59,6 +59,10 @@ Además de los parámetros de `/rutear`:
 - `peso_prioridad` (0–5, por defecto 1) — cuánto se adelanta a las tiendas
   prioritarias. 0 = solo son las últimas en quedarse fuera.
 - `balanceo` (`ninguno`, `tiempo`, `paradas`) — rutas parejas.
+- `bases[]` (`id`, `nombre`, `lat`, `lon`) y `flota[].base` — flota repartida
+  entre varios centros. Cada vehículo sale de su base y, si la ruta es
+  cerrada, vuelve a ella; un tipo sin base sale de la primera. Sin `bases`,
+  todos salen de `cd_lat`/`cd_lon`. Cada ruta devuelve su `base`.
 
 Devuelve `motivos`: por qué quedó fuera cada tienda sin asignar.
 
@@ -71,6 +75,7 @@ y entre qué dos paradas.
 - `rutas[]` — por ruta: `lat`/`lon` (dónde está el vehículo; vacío = en el
   centro), `hora` (desde cuándo está libre ahí; vacío = `hora_actual`),
   `pendientes` (lo que le queda, en su orden; lo gestionado no se manda),
+  `base_lat`/`base_lon` (su centro, si no es el común),
   `fijas` (cuántas de las primeras no se tocan), `capacidad_libre`,
   `paradas_libres` y `etiquetas` (vacío = no se sabe: no restringe, y la
   respuesta lo avisa en `sin_comprobar`).

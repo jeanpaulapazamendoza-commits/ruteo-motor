@@ -79,6 +79,16 @@ class TipoVehiculo(BaseModel):
     max_tiendas: int = Field(0, ge=0, description="0 = sin límite")
     # Lo que tiene este tipo de vehículo: refrigerado, moto, rampa…
     etiquetas: list[str] = []
+    # De qué base salen, cuando hay varias. Solo lo mira /planificar.
+    base: str | None = None
+
+
+class Base(BaseModel):
+    """Un centro del que salen vehículos."""
+    id: str
+    nombre: str = ""
+    lat: float
+    lon: float
 
 
 class PeticionAgrupar(BaseModel):
@@ -132,6 +142,9 @@ class PeticionPlanificar(BaseModel):
     # se visitan antes si el rodeo es razonable; más = con más empeño.
     peso_prioridad: float = Field(1, ge=0, le=5)
     balanceo: Literal["ninguno", "tiempo", "paradas"] = "ninguno"
+    # Flota repartida en varios centros. Vacío = todos salen de cd_lat/cd_lon.
+    # Un tipo de vehículo sin base sale de la primera.
+    bases: list[Base] = []
 
 
 class RutaEnCurso(BaseModel):
@@ -140,6 +153,9 @@ class RutaEnCurso(BaseModel):
     # Dónde está el vehículo. Sin posición, se entiende que sigue en el centro.
     lat: float | None = None
     lon: float | None = None
+    # Su centro, si no es el común: de ahí salió y ahí vuelve.
+    base_lat: float | None = None
+    base_lon: float | None = None
     # Desde qué hora está libre en ese punto. Vacío = la hora de la petición.
     hora: str | None = None
     # Lo que le queda, en su orden. Lo ya gestionado no se manda.
@@ -493,6 +509,19 @@ def planificar(p: PeticionPlanificar):
     for tipo in p.flota:
         tiene.extend([_etiquetas(tipo.etiquetas)] * tipo.cantidad)
 
+    # De qué base sale cada vehículo de la flota ya desplegada.
+    bases = [(b.lat, b.lon) for b in p.bases] or None
+    base_vehiculo = None
+    if p.bases:
+        if len(p.bases) > 20:
+            raise HTTPException(400, "Máximo 20 bases por planificación.")
+        pos_base = {b.id: i for i, b in enumerate(p.bases)}
+        base_vehiculo = []
+        for tipo in p.flota:
+            if tipo.base is not None and tipo.base not in pos_base:
+                raise HTTPException(400, f"Un vehículo sale de una base que no se mandó: {tipo.base}")
+            base_vehiculo.extend([pos_base.get(tipo.base, 0)] * tipo.cantidad)
+
     try:
         res = planificar_flota(
             df[["latitud", "longitud"]].values.astype(float),
@@ -502,6 +531,7 @@ def planificar(p: PeticionPlanificar):
             tiempo_seg=p.tiempo_s, costo_fijo=p.costo_fijo, costo_km=p.costo_km,
             etiquetas_tienda=pide, etiquetas_vehiculo=tiene,
             peso_prioridad=p.peso_prioridad, balanceo=p.balanceo,
+            bases=bases, base_vehiculo=base_vehiculo,
         )
     except Exception as e:
         raise HTTPException(500, f"No se pudo planificar: {type(e).__name__}: {e}")
@@ -531,9 +561,12 @@ def planificar(p: PeticionPlanificar):
             "eta": segundos_a_hora(r["llegadas"].get(t)),
         } for n, t in enumerate(r["orden"])]
 
-        coords_orden = ([(p.cd_lat, p.cd_lon)]
+        # De dónde sale: su base, o el centro común si no hay varias.
+        base = p.bases[r["base_idx"]] if p.bases else None
+        origen = (base.lat, base.lon) if base else (p.cd_lat, p.cd_lon)
+        coords_orden = ([origen]
                         + [(x["lat"], x["lon"]) for x in paradas]
-                        + ([(p.cd_lat, p.cd_lon)] if p.cerrado else []))
+                        + ([origen] if p.cerrado else []))
 
         # El trazado y los kilómetros, por calles reales si se pidió y se puede.
         km = r["dist_m"] / 1000.0
@@ -563,9 +596,11 @@ def planificar(p: PeticionPlanificar):
             "aviso": aviso_matriz,
             "geometria": [[float(la), float(lo)] for la, lo in geometria],
             "links_maps": links_google_maps(coords_orden),
+            "base": base.model_dump() if base else None,
         })
         grupos.append({
             "indice": i,
+            "base": base.id if base else None,
             "tiendas": [x["id"] for x in paradas],
             "n_tiendas": len(paradas),
             "bultos": int(sub["cantidad_bultos"].sum()),
@@ -603,6 +638,8 @@ def planificar(p: PeticionPlanificar):
             "balanceo": p.balanceo,
             "peso_prioridad": p.peso_prioridad,
             "con_etiquetas": sum(1 for e in pide if e),
+            "bases": len(p.bases),
+            "bases_usadas": len({r["base_idx"] for r in res["rutas"]}) if p.bases else 0,
         },
     })
 
@@ -635,6 +672,7 @@ def insertar(p: PeticionInsertar):
 
     rutas = [{
         "id": r.id, "lat": r.lat, "lon": r.lon,
+        "base": (r.base_lat, r.base_lon) if r.base_lat is not None and r.base_lon is not None else None,
         "hora_s": hora_a_segundos(r.hora) if hora_a_segundos(r.hora) is not None else ahora_s,
         "pendientes": [parada(t) for t in r.pendientes],
         "fijas": r.fijas,
