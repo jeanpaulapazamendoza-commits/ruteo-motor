@@ -30,9 +30,10 @@ from motor_ruteo import (
     rutear_cluster_ortools,
     segundos_a_hora,
 )
-# Estos dos no salen de la app de Streamlit: se importan por su nombre para que
+# Estos no salen de la app de Streamlit: se importan por su nombre para que
 # volver a extraer el motor (que reescribe __init__.py) no los deje fuera.
 from motor_ruteo import calles as calles_osrm
+from motor_ruteo.insertar import insertar_en_rutas
 from motor_ruteo.planificar import planificar_flota
 from sklearn.cluster import KMeans, MiniBatchKMeans
 
@@ -131,6 +132,43 @@ class PeticionPlanificar(BaseModel):
     # se visitan antes si el rodeo es razonable; más = con más empeño.
     peso_prioridad: float = Field(1, ge=0, le=5)
     balanceo: Literal["ninguno", "tiempo", "paradas"] = "ninguno"
+
+
+class RutaEnCurso(BaseModel):
+    """Una ruta tal como está ahora mismo: solo lo que le queda por hacer."""
+    id: str
+    # Dónde está el vehículo. Sin posición, se entiende que sigue en el centro.
+    lat: float | None = None
+    lon: float | None = None
+    # Desde qué hora está libre en ese punto. Vacío = la hora de la petición.
+    hora: str | None = None
+    # Lo que le queda, en su orden. Lo ya gestionado no se manda.
+    pendientes: list[Tienda] = []
+    # Cuántas de las primeras no se tocan: el conductor ya va hacia ellas.
+    fijas: int = Field(0, ge=0)
+    # Lo que aún admite. Vacío = sin límite.
+    capacidad_libre: int | None = None
+    paradas_libres: int | None = None
+    # Lo que tiene el vehículo. Vacío = no se sabe: no restringe, pero se avisa.
+    etiquetas: list[str] | None = None
+
+
+class PeticionInsertar(BaseModel):
+    """Pedidos nuevos contra rutas en marcha. Ver `motor_ruteo/insertar.py`."""
+    rutas: list[RutaEnCurso]
+    nuevas: list[Tienda]
+    cd_lat: float
+    cd_lon: float
+    motor: Literal["osrm", "haversine"] = "osrm"
+    cerrado: bool = True
+    hora_actual: str = Field(description="HH:MM, en la zona de la operación")
+    servicio_min: float = 10
+    servicio_min_bulto: float = 0
+    # Hora a la que tiene que haber terminado todo. Vacío = sin límite.
+    fin_jornada: str | None = None
+    # Retocar el orden de las rutas que reciban algo. Las demás nunca se tocan.
+    reordenar: bool = False
+    peso_prioridad: float = Field(1, ge=0, le=5)
 
 
 class PeticionSector(BaseModel):
@@ -565,6 +603,87 @@ def planificar(p: PeticionPlanificar):
             "balanceo": p.balanceo,
             "peso_prioridad": p.peso_prioridad,
             "con_etiquetas": sum(1 for e in pide if e),
+        },
+    })
+
+
+@app.post("/insertar")
+def insertar(p: PeticionInsertar):
+    """Busca el mejor hueco para cada pedido nuevo en las rutas en marcha.
+
+    No reparte el día otra vez: cada vehículo parte de donde está, lo ya
+    gestionado no cuenta y el orden de lo pendiente se respeta. Devuelve, por
+    cada ruta que recibe algo, su nuevo orden completo de pendientes."""
+    if len(p.nuevas) > 200:
+        raise HTTPException(400, "Máximo 200 pedidos por inserción.")
+    if len(p.rutas) > 300:
+        raise HTTPException(400, "Máximo 300 rutas por inserción.")
+    ahora_s = hora_a_segundos(p.hora_actual)
+    if ahora_s is None:
+        raise HTTPException(400, "La hora actual no se entiende: se espera HH:MM.")
+
+    def parada(t: Tienda) -> dict:
+        ini, fin = hora_a_segundos(t.ventana_ini), hora_a_segundos(t.ventana_fin)
+        bultos = max(0, int(t.bultos))
+        return {
+            "id": t.id, "lat": t.lat, "lon": t.lon, "bultos": bultos,
+            "servicio_s": p.servicio_min * 60 + bultos * p.servicio_min_bulto * 60,
+            "ventana": (ini, fin) if ini is not None and fin is not None and fin > ini else None,
+            "prioridad": t.prioridad,
+            "etiquetas": _etiquetas(t.etiquetas),
+        }
+
+    rutas = [{
+        "id": r.id, "lat": r.lat, "lon": r.lon,
+        "hora_s": hora_a_segundos(r.hora) if hora_a_segundos(r.hora) is not None else ahora_s,
+        "pendientes": [parada(t) for t in r.pendientes],
+        "fijas": r.fijas,
+        "cap_libre": r.capacidad_libre,
+        "paradas_libres": r.paradas_libres,
+        "etiquetas": None if r.etiquetas is None else _etiquetas(r.etiquetas),
+    } for r in p.rutas]
+    nuevas = [parada(t) for t in p.nuevas]
+    if len({t["id"] for t in nuevas}) != len(nuevas):
+        raise HTTPException(400, "Hay pedidos repetidos en la petición.")
+
+    try:
+        res = insertar_en_rutas(
+            rutas, nuevas, p.cd_lat, p.cd_lon,
+            motor=p.motor, cerrado=p.cerrado,
+            fin_jornada_s=hora_a_segundos(p.fin_jornada),
+            reordenar=p.reordenar, peso_prioridad=p.peso_prioridad,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"No se pudo insertar: {type(e).__name__}: {e}")
+
+    return _sin_nan({
+        "rutas": [{
+            "id": r["id"],
+            "orden": r["orden"],
+            "etas": {k: segundos_a_hora(v) for k, v in r["llegadas"].items()},
+            "fin": segundos_a_hora(r["fin_s"]),
+            "fin_antes": segundos_a_hora(r["fin_antes_s"]),
+            "min_extra": round((r["fin_s"] - r["fin_antes_s"]) / 60.0, 1),
+            "km_extra": round(r["dist_extra_m"] / 1000.0, 2),
+            "nuevas": r["nuevas"],
+            "reordenada": r["reordenada"],
+        } for r in res["rutas"]],
+        "inserciones": {k: {
+            "ruta": v["ruta"],
+            "posicion": v["posicion"],
+            "despues_de": v["despues_de"],
+            "eta": segundos_a_hora(v["llegada_s"]),
+            "km_extra": round(v["dist_extra_m"] / 1000.0, 2),
+            "sin_comprobar": v["sin_comprobar"],
+        } for k, v in res["inserciones"].items()},
+        "sin_asignar": list(res["sin_asignar"].keys()),
+        "motivos": res["sin_asignar"],
+        "resumen": {
+            "pedidos": len(nuevas),
+            "colocados": len(res["inserciones"]),
+            "sin_asignar": len(res["sin_asignar"]),
+            "rutas_tocadas": len(res["rutas"]),
+            "matriz": res["matriz"],
         },
     })
 

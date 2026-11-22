@@ -22,6 +22,7 @@ Documentación interactiva en <http://localhost:8010/docs>.
 | POST | `/agrupar` | Agrupa tiendas por capacidad, bultos, flota o K-Means |
 | POST | `/rutear` | Calcula la ruta óptima de cada grupo (OR-Tools) |
 | POST | `/planificar` | Reparte y ordena en un solo cálculo, con capacidad, ventanas y jornada como límites |
+| POST | `/insertar` | Busca el mejor hueco para pedidos nuevos en rutas que ya están en marcha |
 | POST | `/tiendas-en-sector` | Qué tiendas caen dentro de un polígono del mapa |
 
 ### `/agrupar`
@@ -61,6 +62,31 @@ Además de los parámetros de `/rutear`:
 
 Devuelve `motivos`: por qué quedó fuera cada tienda sin asignar.
 
+### `/insertar`
+
+Para pedidos que llegan con el reparto ya en la calle. No reparte el día otra
+vez: recibe cada ruta tal como está ahora y decide a cuál va cada pedido nuevo
+y entre qué dos paradas.
+
+- `rutas[]` — por ruta: `lat`/`lon` (dónde está el vehículo; vacío = en el
+  centro), `hora` (desde cuándo está libre ahí; vacío = `hora_actual`),
+  `pendientes` (lo que le queda, en su orden; lo gestionado no se manda),
+  `fijas` (cuántas de las primeras no se tocan), `capacidad_libre`,
+  `paradas_libres` y `etiquetas` (vacío = no se sabe: no restringe, y la
+  respuesta lo avisa en `sin_comprobar`).
+- `nuevas[]` — los pedidos, con la misma forma que una tienda.
+- `fin_jornada` (HH:MM) — hora a la que tiene que haber terminado todo.
+- `reordenar` — permite retocar el orden de las rutas que reciban algo, si
+  ahorra recorrido. Las demás nunca se tocan.
+
+Una inserción no puede sacar a ninguna parada de su ventana ni pasar la ruta
+de la jornada. Si una parada ya iba tarde, se exige no empeorarla.
+
+Devuelve, por cada ruta que recibe algo, su nuevo `orden` completo de
+pendientes con `etas`, `km_extra` y `min_extra`; por cada pedido, su
+`inserciones` (ruta, posición, tras qué parada, hora); y `motivos` para lo
+que no encontró hueco. No usa el solver: prueba todos los huecos.
+
 ## Servidor de calles
 
 Las distancias y tiempos por calles salen de OSRM. Sin configurar nada se usa
@@ -92,8 +118,8 @@ python extraer_motor.py
 
 Reescribe `motor_ruteo/*.py` quitando los decoradores de Streamlit
 (`@st.cache_data` → `@lru_cache`). No edites esos archivos a mano.
-`planificar.py` y `calles.py` no vienen de Streamlit: son de este servicio y
-la extracción no los toca.
+`planificar.py`, `calles.py` e `insertar.py` no vienen de Streamlit: son de
+este servicio y la extracción no los toca.
 
 ## Despliegue
 
