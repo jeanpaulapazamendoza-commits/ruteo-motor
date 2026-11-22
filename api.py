@@ -204,6 +204,8 @@ class PeticionReordenar(BaseModel):
     final_id: str | None = None
     # Cuántas de las primeras no se mueven.
     fijas: int = Field(0, ge=0)
+    # Paradas que conservan su puesto: las demás se ordenan a su alrededor.
+    ancladas: list[str] = []
     motor: Literal["osrm", "haversine"] = "osrm"
     servicio_min: float = 10
     servicio_min_bulto: float = 0
@@ -784,6 +786,7 @@ def reordenar(p: PeticionReordenar):
         res = reordenar_ruta(
             paradas, p.lat, p.lon, hora_s,
             centro=centro, final=p.final, final_id=p.final_id, fijas=p.fijas,
+            ancladas=p.ancladas,
             motor=p.motor, optimizar=p.optimizar, tiempo_seg=p.tiempo_s,
         )
     except Exception as e:

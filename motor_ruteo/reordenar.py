@@ -13,6 +13,11 @@ Se le dice de dónde parte —el centro, o donde esté el vehículo ahora— y d
 termina: de vuelta en el centro, en una parada concreta, o donde caiga. Las
 primeras `fijas` no se mueven: el conductor ya va hacia ellas.
 
+Además se pueden anclar paradas sueltas: una parada anclada conserva su
+puesto en la ruta —la tercera sigue siendo la tercera— y las demás se
+ordenan a su alrededor. Es la forma de decir «a este cliente voy primero
+pase lo que pase» sin renunciar a que el resto se optimice.
+
 Sirve también para lo contrario: con `optimizar=False` no cambia nada y solo
 dice cuánto recorre y a qué hora llega a cada parada el orden que se le dio.
 Es lo que hace falta cuando el orden lo pone una persona a mano.
@@ -69,8 +74,8 @@ def _resumen(ids, seq, llegadas, fin, metros, vent):
 
 
 def reordenar_ruta(paradas, lat, lon, hora_s, *, centro=None, final="centro",
-                   final_id=None, fijas=0, motor="osrm", optimizar=True,
-                   tiempo_seg=5):
+                   final_id=None, fijas=0, ancladas=(), motor="osrm",
+                   optimizar=True, tiempo_seg=5):
     """Ordena las paradas que le quedan a una ruta.
 
     paradas: lista de dicts, en su orden actual, con id, lat, lon,
@@ -81,6 +86,7 @@ def reordenar_ruta(paradas, lat, lon, hora_s, *, centro=None, final="centro",
     final: 'centro' (vuelve), 'parada' (termina en `final_id`) o 'libre'
         (termina donde le convenga).
     fijas: cuántas de las primeras no se mueven.
+    ancladas: ids de paradas que conservan el puesto que tienen.
     optimizar: False = no cambia el orden, solo lo evalúa.
 
     Devuelve un dict con
@@ -169,6 +175,24 @@ def reordenar_ruta(paradas, lat, lon, hora_s, *, centro=None, final="centro",
     modelo.AddDimension(cb_t, 24 * 3600, horizonte, False, "Tiempo")
     tiempo = modelo.GetDimensionOrDie("Tiempo")
     tiempo.CumulVar(modelo.Start(0)).SetRange(int(salida_s), int(salida_s))
+
+    # Las ancladas: una cuenta de paradas visitadas, y cada anclada tiene que
+    # caer justo en su número. Una que coincida con el puesto del final
+    # obligado cede: no pueden ser las dos la última.
+    puesto = {}
+    for ident in ancladas or ():
+        if ident in ids:
+            nodo = ids.index(ident)
+            if nodo in movibles and actual.index(nodo) - fijas < len(movibles):
+                puesto[nodo] = actual.index(nodo) - fijas + 1
+    if puesto:
+        cb_uno = modelo.RegisterUnaryTransitCallback(lambda _i: 1)
+        modelo.AddDimension(cb_uno, 0, tam + 1, True, "Puesto")
+        cuenta = modelo.GetDimensionOrDie("Puesto")
+        for a in range(1, len(movibles) + 1):
+            if locales[a] in puesto:
+                k = puesto[locales[a]]
+                cuenta.CumulVar(gestor.NodeToIndex(a)).SetRange(k, k)
     for a in range(1, tam):
         nodo = locales[a]
         if nodo is None or vent[nodo] is None:
